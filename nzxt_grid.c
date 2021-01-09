@@ -169,7 +169,7 @@ static uint8_t nzxt_grid_pwm_to_percent(long hwmon_value)
 	if (hwmon_value < 0)
 		return 0;
 
-	if (hwmon_value > LONG_MAX / 100)
+	if (hwmon_value >= 255)
 		return 100;
 
 	return (uint8_t)(hwmon_value * 100 / 255);
