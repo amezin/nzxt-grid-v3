@@ -8,7 +8,10 @@
 
 #define NZXT_GRID_MAX_CHANNELS 6
 
-#define NZXT_GRID_STATUS_REPORT_ID 4
+enum {
+	nzxt_grid_report_id_command = 2,
+	nzxt_grid_report_id_status = 4,
+};
 
 struct nzxt_grid_status_report {
 	uint8_t report_id;
@@ -37,6 +40,25 @@ nzxt_grid_get_fan_type(const struct nzxt_grid_status_report *report)
 {
 	return report->channel_index_and_fan_type & 0x3;
 }
+
+struct nzxt_grid_command_output_report {
+	uint8_t report_id;
+	uint8_t command;
+} __attribute__((packed));
+
+enum nzxt_grid_command {
+	nzxt_grid_command_detect_fans = 0x5c,
+	nzxt_grid_command_start_reporting = 0x5d,
+	nzxt_grid_command_set_fan_speed = 0x4d,
+};
+
+struct nzxt_grid_command_set_fan_speed_output_report {
+	uint8_t report_id;
+	uint8_t command;
+	uint8_t channel_index;
+	uint8_t unknown1;
+	uint8_t fan_speed_percent;
+} __attribute__((packed));
 
 #define NZXT_GRID_OUTPUT_REPORT_SIZE 65
 
@@ -175,19 +197,16 @@ static uint8_t nzxt_grid_pwm_to_percent(long hwmon_value)
 	return (uint8_t)(hwmon_value * 100 / 255);
 }
 
-static int nzxt_grid_hwmon_write_pwm_fixed(struct nzxt_grid_device *grid,
-					   int channel, long val)
+static int nzxt_grid_send_output_report(struct nzxt_grid_device *grid,
+					const void *data, size_t size)
 {
-	uint8_t *buffer = kzalloc(NZXT_GRID_OUTPUT_REPORT_SIZE, GFP_KERNEL);
+	void *buffer = kzalloc(NZXT_GRID_OUTPUT_REPORT_SIZE, GFP_KERNEL);
 	int ret;
 
 	if (!buffer)
 		return -ENOMEM;
 
-	buffer[0] = 0x2;
-	buffer[1] = 0x4d;
-	buffer[2] = (uint8_t)channel;
-	buffer[4] = nzxt_grid_pwm_to_percent(val);
+	memcpy(buffer, data, size);
 
 	ret = hid_hw_output_report(grid->hid, buffer,
 				   NZXT_GRID_OUTPUT_REPORT_SIZE);
@@ -197,12 +216,25 @@ static int nzxt_grid_hwmon_write_pwm_fixed(struct nzxt_grid_device *grid,
 	return (ret < 0) ? ret : 0;
 }
 
+static int nzxt_grid_hwmon_write_pwm_input(struct nzxt_grid_device *grid,
+					   int channel, long val)
+{
+	struct nzxt_grid_command_set_fan_speed_output_report report;
+	report.report_id = nzxt_grid_report_id_command;
+	report.command = nzxt_grid_command_set_fan_speed;
+	report.channel_index = (uint8_t)channel;
+	report.unknown1 = 0;
+	report.fan_speed_percent = nzxt_grid_pwm_to_percent(val);
+
+	return nzxt_grid_send_output_report(grid, &report, sizeof(report));
+}
+
 static int nzxt_grid_hwmon_write_pwm(struct nzxt_grid_device *grid, u32 attr,
 				     int channel, long val)
 {
 	switch (attr) {
 	case hwmon_pwm_input:
-		return nzxt_grid_hwmon_write_pwm_fixed(grid, channel, val);
+		return nzxt_grid_hwmon_write_pwm_input(grid, channel, val);
 
 	default:
 		return -EINVAL;
@@ -324,40 +356,20 @@ static int nzxt_grid_raw_event(struct hid_device *hdev,
 	return 0;
 }
 
-static int nzxt_grid_init_or_reset(struct nzxt_grid_device *grid)
+static int nzxt_grid_detect_fans(struct nzxt_grid_device *grid)
 {
-	/* Without this, the device can't control DC fans.
-	 * Though it detects fan type properly, even without init (?!) */
-	uint8_t *buffer = kzalloc(NZXT_GRID_OUTPUT_REPORT_SIZE, GFP_KERNEL);
-	int ret;
+	struct nzxt_grid_command_output_report report;
+	report.report_id = nzxt_grid_report_id_command;
+	report.command = nzxt_grid_command_detect_fans;
+	return nzxt_grid_send_output_report(grid, &report, sizeof(report));
+}
 
-	if (!buffer)
-		return -ENOMEM;
-
-	buffer[0] = 0x1;
-	buffer[1] = 0x5c;
-
-	ret = hid_hw_output_report(grid->hid, buffer,
-				   NZXT_GRID_OUTPUT_REPORT_SIZE);
-
-	if (ret < 0)
-		goto fail;
-
-	buffer[0] = 0x1;
-	buffer[1] = 0x5d;
-
-	ret = hid_hw_output_report(grid->hid, buffer,
-				   NZXT_GRID_OUTPUT_REPORT_SIZE);
-
-	if (ret < 0)
-		goto fail;
-
-	ret = 0;
-
-fail:
-	kfree(buffer);
-
-	return ret;
+static int nzxt_grid_start_reporting(struct nzxt_grid_device *grid)
+{
+	struct nzxt_grid_command_output_report report;
+	report.report_id = nzxt_grid_report_id_command;
+	report.command = nzxt_grid_command_start_reporting;
+	return nzxt_grid_send_output_report(grid, &report, sizeof(report));
 }
 
 static int nzxt_grid_probe(struct hid_device *hdev,
@@ -390,7 +402,11 @@ static int nzxt_grid_probe(struct hid_device *hdev,
 
 	hid_device_io_start(hdev);
 
-	ret = nzxt_grid_init_or_reset(grid);
+	ret = nzxt_grid_detect_fans(grid);
+	if (ret)
+		goto out_hw_close;
+
+	ret = nzxt_grid_start_reporting(grid);
 	if (ret)
 		goto out_hw_close;
 
@@ -421,7 +437,7 @@ static void nzxt_grid_remove(struct hid_device *hdev)
 }
 
 static const struct hid_report_id nzxt_grid_reports[] = {
-	{ HID_REPORT_ID(NZXT_GRID_STATUS_REPORT_ID) },
+	{ HID_REPORT_ID(nzxt_grid_report_id_status) },
 	{}
 };
 
