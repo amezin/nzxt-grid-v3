@@ -352,7 +352,7 @@ static int nzxt_grid_init_or_reset(struct nzxt_grid_device *grid)
 	if (ret < 0)
 		goto fail;
 
-	return 0;
+	ret = 0;
 
 fail:
 	kfree(buffer);
